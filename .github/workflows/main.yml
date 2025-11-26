@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       rdp_pass:
-        description: "Enter RDP Password"
+        description: "Enter RDP Password (min 8 chars, upper, lower, number, special)"
         required: true
         type: string
 
@@ -19,26 +19,70 @@ jobs:
 
     steps:
 
+      # -----------------------------
+      # ENABLE RDP
+      # -----------------------------
       - name: Enable RDP
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                            -Name "fDenyTSConnections" -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP-Allow"
           netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
-      - name: Create User (from inputs)
+      # -----------------------------
+      # CREATE USER WITH VALIDATION
+      # -----------------------------
+      - name: Create User With Password Validation
         run: |
           $Username = "${{ github.event.inputs.rdp_user }}"
           $Password = "${{ github.event.inputs.rdp_pass }}"
-          $securePass = ConvertTo-SecureString $Password -AsPlainText -Force
 
-          New-LocalUser -Name $Username -Password $securePass -AccountNeverExpires
+          Write-Host "Validating password..."
+
+          # ========== PASSWORD VALIDATION ==========
+          if ($Password.Length -lt 8) {
+            Write-Error "Password must be at least 8 characters long."
+            exit 1
+          }
+
+          if ($Password -notmatch "[A-Z]") {
+            Write-Error "Password must contain at least one uppercase letter."
+            exit 1
+          }
+
+          if ($Password -notmatch "[a-z]") {
+            Write-Error "Password must contain at least one lowercase letter."
+            exit 1
+          }
+
+          if ($Password -notmatch "[0-9]") {
+            Write-Error "Password must contain at least one number."
+            exit 1
+          }
+
+          if ($Password -notmatch "[!@#$%^&*()_+\-=\[\]{};':"",.<>/?]") {
+            Write-Error "Password must contain at least one special character."
+            exit 1
+          }
+          # ========================================
+
+          # Create secure password
+          $SecurePass = ConvertTo-SecureString $Password -AsPlainText -Force
+
+          # Create user
+          New-LocalUser -Name $Username -Password $SecurePass -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member $Username
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username
 
           echo "RDP_USER=$Username" >> $env:GITHUB_ENV
           echo "RDP_PASS=$Password" >> $env:GITHUB_ENV
 
+          Write-Host "User created successfully!"
+
+      # -----------------------------
+      # INSTALL TAILSCALE
+      # -----------------------------
       - name: Install Tailscale
         run: |
           $Url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
@@ -46,26 +90,45 @@ jobs:
           Invoke-WebRequest -Uri $Url -OutFile $Path
           Start-Process msiexec.exe -ArgumentList "/i `"$Path`" /quiet /norestart" -Wait
 
+      # -----------------------------
+      # CONNECT TAILSCALE
+      # -----------------------------
       - name: Connect to Tailscale
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }}
-          Start-Sleep 5
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+              --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+              --hostname=gh-runner-${{ github.run_id }}
+
+          Start-Sleep -Seconds 5
+
           $tsip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+
+          if (-not $tsip) {
+            Write-Error "Failed to get Tailscale IP."
+            exit 1
+          }
+
           echo "TAILSCALE_IP=$tsip" >> $env:GITHUB_ENV
 
-      - name: Show RDP info
+      # -----------------------------
+      # SHOW CONNECTION DETAILS
+      # -----------------------------
+      - name: Show RDP Connection Details
         run: |
+          Write-Host "`n=========================================="
+          Write-Host "         RDP CONNECTION DETAILS"
           Write-Host "=========================================="
-          Write-Host "   RDP CONNECT INFO"
-          Write-Host "------------------------------------------"
-          Write-Host "IP: $env:TAILSCALE_IP"
-          Write-Host "User: $env:RDP_USER"
-          Write-Host "Pass: $env:RDP_PASS"
-          Write-Host "=========================================="
+          Write-Host "Tailscale IP : $env:TAILSCALE_IP"
+          Write-Host "Username     : $env:RDP_USER"
+          Write-Host "Password     : $env:RDP_PASS"
+          Write-Host "==========================================`n"
 
-      - name: Keep Session Alive
+      # -----------------------------
+      # KEEP RUNNER ALIVE
+      # -----------------------------
+      - name: Keep Alive
         run: |
           while ($true) {
-            Write-Host "Runner Active... $(Get-Date)"
+            Write-Host "RDP Active... $(Get-Date)"
             Start-Sleep -Seconds 300
           }
