@@ -3,132 +3,101 @@ name: RDP
 on:
   workflow_dispatch:
     inputs:
-      rdp_user:
+      rdp_username:
         description: "Enter RDP Username"
         required: true
         type: string
-      rdp_pass:
-        description: "Enter RDP Password (min 8 characters: Upper, Lower, Number, Special)"
+      rdp_password:
+        description: "Enter RDP Password"
+        required: true
+        type: string
+      tailscale_authkey:
+        description: "Enter Tailscale Auth Key"
         required: true
         type: string
 
 jobs:
-  rdp:
+  secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
-
-      # -----------------------------
-      # ENABLE RDP
-      # -----------------------------
-      - name: Enable RDP
+      - name: Configure Core RDP Settings
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Allow" >$null 2>&1
-          netsh advfirewall firewall add rule name="RDP-Allow" `
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
-          Restart-Service TermService -Force
+          Restart-Service -Name TermService -Force
 
-      # -----------------------------
-      # CREATE USER WITH VALIDATION
-      # -----------------------------
-      - name: Create User With Password Validation
+      - name: Create RDP User (From Inputs)
         run: |
-          $Username = "${{ github.event.inputs.rdp_user }}"
-          $Password = "${{ github.event.inputs.rdp_pass }}"
+          $username = "${{ github.event.inputs.rdp_username }}"
+          $password = "${{ github.event.inputs.rdp_password }}"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
 
-          Write-Host "Validating password..."
+          # Create User
+          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
 
-          if ($Password.Length -lt 8) {
-            Write-Error "Password must be at least 8 characters."
-            exit 1
-          }
-          if ($Password -notmatch "[A-Z]") {
-            Write-Error "Password must contain at least one uppercase letter."
-            exit 1
-          }
-          if ($Password -notmatch "[a-z]") {
-            Write-Error "Password must contain at least one lowercase letter."
-            exit 1
-          }
-          if ($Password -notmatch "[0-9]") {
-            Write-Error "Password must contain at least one number."
-            exit 1
-          }
-          if ($Password -notmatch "[!@#$%^&*()_\-+=\[\]{};':"",.<>/?]") {
-            Write-Error "Password must contain at least one special character."
-            exit 1
-          }
+          echo "RDP_USER=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
-          $SecurePass = ConvertTo-SecureString $Password -AsPlainText -Force
-
-          New-LocalUser -Name $Username -Password $SecurePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member $Username
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Username
-
-          echo "RDP_USER=$Username" >> $env:GITHUB_ENV
-          echo "RDP_PASS=$Password" >> $env:GITHUB_ENV
-
-      # -----------------------------
-      # INSTALL TAILSCALE
-      # -----------------------------
       - name: Install Tailscale
         run: |
-          $URL = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $Installer = "$env:TEMP\tailscale.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
+          Remove-Item $installerPath -Force
 
-          Invoke-WebRequest $URL -OutFile $Installer
-          Start-Process msiexec.exe -ArgumentList "/i `"$Installer`" /quiet /norestart" -Wait
-          Remove-Item $Installer -Force
-
-      # -----------------------------
-      # CONNECT TAILSCALE
-      # -----------------------------
-      - name: Connect Tailscale
+      - name: Establish Tailscale Connection
         run: |
-          $AUTH = "${{ secrets.TAILSCALE_AUTH_KEY }}"
-
-          if (-not ($AUTH -match "^tskey-auth-")) {
-            Write-Error "❌ INVALID AUTH KEY — Must start with 'tskey-auth-'"
-            exit 1
-          }
-
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=$AUTH `
-            --hostname=gh-runner-${{ github.run_id }}
-
-          Start-Sleep -Seconds 8
-
-          $tsip = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-
-          if (-not $tsip) {
-            Write-Error "Failed to obtain Tailscale IP."
-            exit 1
+              --authkey="${{ github.event.inputs.tailscale_authkey }}" `
+              --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
+          $tsIP = $null
+          for ($i=0; $i -lt 10 -and -not $tsIP; $i++) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
           }
 
-          echo "TAILSCALE_IP=$tsip" >> $env:GITHUB_ENV
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned"
+              exit 1
+          }
 
-      # -----------------------------
-      # SHOW CONNECTION DETAILS
-      # -----------------------------
-      - name: Show RDP Details
-        run: |
-          Write-Host "`n========= RDP DETAILS ========="
-          Write-Host "IP Address : $env:TAILSCALE_IP"
-          Write-Host "Username   : $env:RDP_USER"
-          Write-Host "Password   : $env:RDP_PASS"
-          Write-Host "================================`n"
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      # -----------------------------
-      # KEEP SESSION ALIVE
-      # -----------------------------
-      - name: Keep Alive
+      - name: Verify RDP Port
         run: |
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) {
+              Write-Error "RDP port not accessible!"
+              exit 1
+          }
+          Write-Host "RDP Port OK!"
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n===== RDP ACCESS ====="
+          Write-Host "IP: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host "=======================`n"
+
           while ($true) {
-            Write-Host "RDP Active $(Get-Date)"
-            Start-Sleep -Seconds 300
+              Write-Host "[$(Get-Date)] RDP Active..."
+              Start-Sleep -Seconds 300
           }
